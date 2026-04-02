@@ -1,9 +1,9 @@
 import os
 import google.generativeai as genai
 import json
+import time
 
-# API Provisioning: Ensure your API key is loaded into your .env file
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+# API Provisioning: Handled dynamically with failover using get_api_keys
 
 # ======================================================================
 # COMPONENT 1: The Constitution (System Prompt)
@@ -182,23 +182,75 @@ respond only with a json object in this exact format
 }
 """
  
+# ======================================================================
+# API FALLBACK LOGIC
+# ======================================================================
+
+def get_api_keys():
+    """Extracts all matching Gemini API keys from environment variables."""
+    keys = []
+    
+    if "GEMINI_API_KEYS" in os.environ:
+        keys.extend([k.strip() for k in os.environ["GEMINI_API_KEYS"].split(",") if k.strip()])
+        
+    for k, v in sorted(os.environ.items()):
+        if k.startswith("GEMINI_API_KEY") and k != "GEMINI_API_KEYS":
+            key_val = v.strip()
+            if key_val and key_val not in keys:
+                keys.append(key_val)
+                
+    if not keys:
+        keys.append(None)
+        
+    return keys
+
+def generate_with_fallback(model_name: str, system_instruction: str, prompt: str):
+    """
+    Attempts to generate content with multiple API keys, instantly falling back 
+    to the next key if one fails (bypassing all delays).
+    """
+    api_keys = get_api_keys()
+    last_error = None
+    
+    for api_key in api_keys:
+        if api_key:
+            genai.configure(api_key=api_key)
+            
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_instruction
+        )
+        
+        try:
+            # We pass request_options={"retry": None} so the Google Library
+            # doesn't auto-pause your terminal for 60s on a 429 error!
+            return model.generate_content(
+                prompt, 
+                request_options={"retry": None}
+            )
+        except Exception as e:
+            last_error = e
+            # Instant failover! Don't wait. We just skip out and try the next key immediately.
+            continue
+            
+    raise Exception(f"All available Gemini API keys failed (no keys left). Last error: {last_error}")
+
+
 def interceptor_check(user_prompt: str) -> tuple[bool, str]:
     """
     Evaluates the prompt for malicious intent.
     Returns a tuple (is_safe: bool, reasoning: str).
     """
-    interceptor_model = genai.GenerativeModel(
-        model_name='gemini-2.5-flash-lite',
-        system_instruction=INTERCEPTOR_SYSTEM_PROMPT
-    )
- 
     check_prompt = f"""Evaluate this user prompt:
     "{user_prompt}"
     Respond ONLY with the JSON object as instructed."""
     
- 
     try:
-        response = interceptor_model.generate_content(check_prompt)
+        response = generate_with_fallback(
+            model_name='gemini-2.5-flash-lite',
+            system_instruction=INTERCEPTOR_SYSTEM_PROMPT,
+            prompt=check_prompt
+        )
         # print(f"[Main Model Response]: {response.text}") 
         raw = response.text.strip()
  
@@ -236,13 +288,12 @@ def generate_response(user_prompt: str) -> str:
         )
  
     # Call the Main Model if safe
-    main_model = genai.GenerativeModel(
-        model_name='gemini-2.5-flash-lite',
-        system_instruction=SYSTEM_PROMPT
-    )
- 
     try:
-        response = main_model.generate_content(user_prompt)
+        response = generate_with_fallback(
+            model_name='gemini-2.5-flash-lite',
+            system_instruction=SYSTEM_PROMPT,
+            prompt=user_prompt
+        )
         return response.text
     except Exception as e:
         return f"Error generating response: {e}"
